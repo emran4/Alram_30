@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>End-Billet Bar Alarm</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
+<style>
+  body{font-family:sans-serif;margin:0;padding:12px;background:#111;color:#eee}
+  h1{font-size:18px;margin:0 0 8px}
+  #wrap{position:relative;width:100%;max-width:600px;touch-action:none}
+  video{width:100%;display:block;background:#000}
+  #box{position:absolute;border:3px solid #0f0;display:none;pointer-events:none}
+  .row{display:flex;gap:8px;margin:8px 0;align-items:center}
+  input{width:70px;padding:6px;font-size:16px}
+  button{padding:12px 16px;font-size:16px;border:0;border-radius:6px;background:#2a7;color:#fff}
+  button.red{background:#c33}
+  #val{font-size:48px;font-weight:bold;margin:6px 0}
+  #status{padding:8px;border-radius:6px;background:#333}
+  .ok{background:#154 !important}.bad{background:#a11 !important}
+  small{color:#aaa}
+</style>
+</head>
+<body>
+<h1>End-Billet Bar Feedback Alarm</h1>
+<div id="wrap"><video id="v" playsinline muted></video><div id="box"></div></div>
+<small>1) Press Start camera. 2) Drag a box over ONLY the number (not the "m"). 3) Press Start monitoring.</small>
+<div class="row">Min <input id="min" type="number" value="10"> Max <input id="max" type="number" value="45"> m</div>
+<div class="row">
+  <button id="cam">Start camera</button>
+  <button id="go" disabled>Start monitoring</button>
+  <button id="ack" class="red" disabled>Stop alarm</button>
+</div>
+<div id="val">--</div>
+<div id="status">Not started</div>
+<small>Backup only. Keep the phone fixed, avoid glare, keep the screen bright and in focus.</small>
+<canvas id="c" style="display:none"></canvas>
+
+<script>
+const $ = id => document.getElementById(id);
+const v = $('v'), box = $('box'), wrap = $('wrap');
+let roi = null, worker = null, timer = null, running = false;
+let badCount = 0, failCount = 0, alarmOn = false, audioCtx = null, alarmTimer = null, wakeLock = null;
+
+function setStatus(t, cls){ const s=$('status'); s.textContent=t; s.className=cls||''; }
+
+$('cam').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}});
+    v.srcObject = stream; await v.play();
+    setStatus('Camera on. Drag a box over the number.');
+  } catch(e){ setStatus('Camera error: ' + e.message + ' (camera needs https or localhost)', 'bad'); }
+};
+
+// draw the region box
+let start = null;
+wrap.addEventListener('pointerdown', e => {
+  const r = v.getBoundingClientRect();
+  start = {x:e.clientX-r.left, y:e.clientY-r.top};
+  box.style.display='block'; drawBox(start.x,start.y,start.x,start.y);
+});
+wrap.addEventListener('pointermove', e => {
+  if(!start) return;
+  const r = v.getBoundingClientRect();
+  drawBox(start.x,start.y,e.clientX-r.left,e.clientY-r.top);
+});
+wrap.addEventListener('pointerup', e => {
+  if(!start) return;
+  const r = v.getBoundingClientRect();
+  const x2=e.clientX-r.left, y2=e.clientY-r.top;
+  const x=Math.min(start.x,x2), y=Math.min(start.y,y2), w=Math.abs(x2-start.x), h=Math.abs(y2-start.y);
+  start=null;
+  if(w<10||h<10){ return; }
+  const sx=v.videoWidth/r.width, sy=v.videoHeight/r.height;
+  roi={x:x*sx,y:y*sy,w:w*sx,h:h*sy};
+  $('go').disabled=false;
+  setStatus('Region set. Press Start monitoring.');
+});
+function drawBox(x1,y1,x2,y2){
+  box.style.left=Math.min(x1,x2)+'px'; box.style.top=Math.min(y1,y2)+'px';
+  box.style.width=Math.abs(x2-x1)+'px'; box.style.height=Math.abs(y2-y1)+'px';
+}
+
+async function readValue(){
+  const c=$('c'), scale=3;
+  c.width=roi.w*scale; c.height=roi.h*scale;
+  const g=c.getContext('2d');
+  g.filter='grayscale(1) contrast(1.6)';
+  g.drawImage(v,roi.x,roi.y,roi.w,roi.h,0,0,c.width,c.height);
+  const {data:{text}} = await worker.recognize(c);
+  const m = text.replace(/,/g,'.').match(/\d+(\.\d+)?/);
+  return m ? parseFloat(m[0]) : NaN;
+}
+
+async function tick(){
+  if(!running) return;
+  try{
+    const val = await readValue();
+    const min=parseFloat($('min').value), max=parseFloat($('max').value);
+    if(isNaN(val)){
+      failCount++; $('val').textContent='--';
+      setStatus('Cannot read number ('+failCount+')');
+      if(failCount>=5) triggerAlarm('CANNOT READ - check camera');
+    } else {
+      failCount=0; $('val').textContent=val.toFixed(1)+' m';
+      if(val<min||val>max){
+        badCount++;
+        setStatus('OUT OF LIMIT ('+badCount+'/2)','bad');
+        if(badCount>=2) triggerAlarm('OUT OF LIMIT: '+val);
+      } else {
+        badCount=0; setStatus('OK, within '+min+' to '+max,'ok');
+      }
+    }
+  }catch(e){ setStatus('Error: '+e.message,'bad'); }
+  timer=setTimeout(tick,1500);
+}
+
+$('go').onclick = async () => {
+  if(running){ running=false; clearTimeout(timer); $('go').textContent='Start monitoring'; setStatus('Stopped'); return; }
+  audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+  audioCtx.resume();
+  setStatus('Loading OCR (needs internet the first time)...');
+  if(!worker){
+    worker = await Tesseract.createWorker('eng');
+    await worker.setParameters({tessedit_char_whitelist:'0123456789.', tessedit_pageseg_mode:'7'});
+  }
+  try{ wakeLock = await navigator.wakeLock.request('screen'); }catch(e){}
+  running=true; badCount=0; failCount=0;
+  $('go').textContent='Stop monitoring';
+  tick();
+};
+
+function beep(){
+  const o=audioCtx.createOscillator(), gn=audioCtx.createGain();
+  o.type='square'; o.frequency.value=880; gn.gain.value=0.5;
+  o.connect(gn); gn.connect(audioCtx.destination);
+  o.start(); o.stop(audioCtx.currentTime+0.4);
+  if(navigator.vibrate) navigator.vibrate(400);
+}
+function triggerAlarm(msg){
+  if(alarmOn) return;
+  alarmOn=true; $('ack').disabled=false; setStatus(msg,'bad');
+  beep(); alarmTimer=setInterval(beep,800);
+}
+$('ack').onclick = () => {
+  alarmOn=false; clearInterval(alarmTimer); $('ack').disabled=true;
+  badCount=0; failCount=0;
+};
+</script>
+</body>
+</html>
